@@ -1,0 +1,7 @@
+{
+  "discord_token": "【後で入力】",
+  "category_names": ["コース受講前", "コース受講前②"],
+  "staff_roles": ["Real us運営", "Real us運営②", "メンター"],
+  "alert_channel_id": "1511922259109871737",
+  "mentor_role_id": "1364250672433725530"
+}
