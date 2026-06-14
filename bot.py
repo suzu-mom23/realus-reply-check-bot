@@ -98,7 +98,7 @@ async def send_discord_notification(guild_name, channel_name, link, staff_info):
         f"⚠️ **返信漏れの可能性があります**\n\n"
         f"**サーバー：** {guild_name}\n"
         f"**チャンネル：** {channel_name}\n"
-        f"**状態：** 24時間以上メンター・運営返信なし\n\n"
+        f"**状態：** 24時間以上メンター・運営から返信なし\n\n"
         f"**該当メッセージ：**\n{link}"
     )
 
