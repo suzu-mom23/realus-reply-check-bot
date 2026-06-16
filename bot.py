@@ -15,21 +15,22 @@ STAFF_ROLES = cfg['staff_roles']
 ALERT_CHANNEL_ID = int(cfg['alert_channel_id'])
 MENTOR_ROLE_ID = int(cfg['mentor_role_id'])
 
-NOTIFIED_FILE = 'notified.json'
+REPLY_NOTIFIED_FILE = 'notified.json'
+FOLLOWUP_NOTIFIED_FILE = 'followup_notified.json'
 MAPPING_FILE = 'staff_mapping.json'
 
 
-def load_notified():
-    if not os.path.exists(NOTIFIED_FILE):
+def load_notified(filename, keep_days):
+    if not os.path.exists(filename):
         return {}
-    with open(NOTIFIED_FILE, encoding='utf-8') as f:
+    with open(filename, encoding='utf-8') as f:
         data = json.load(f)
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
     return {k: v for k, v in data.items() if v > cutoff}
 
 
-def save_notified(data):
-    with open(NOTIFIED_FILE, 'w', encoding='utf-8') as f:
+def save_notified(filename, data):
+    with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
@@ -40,7 +41,8 @@ def load_mapping():
         return json.load(f)
 
 
-notified = load_notified()
+reply_notified = load_notified(REPLY_NOTIFIED_FILE, keep_days=3)
+followup_notified = load_notified(FOLLOWUP_NOTIFIED_FILE, keep_days=14)
 
 
 def get_first_emoji(text):
@@ -76,15 +78,17 @@ def is_staff(member):
     return any(role.name in STAFF_ROLES for role in member.roles)
 
 
-async def send_discord_notification(guild_name, channel_name, link, staff_info):
-    alert_channel = client.get_channel(ALERT_CHANNEL_ID)
+def is_student(member, user=None):
+    if user and user.bot:
+        return False
+    if member and is_staff(member):
+        return False
+    return True
 
-    if alert_channel is None:
-        try:
-            alert_channel = await client.fetch_channel(ALERT_CHANNEL_ID)
-        except Exception as e:
-            print(f"❌ 通知先チャンネル取得エラー: {e}")
-            return
+
+def get_mention_and_assignee(channel_name, mapping):
+    emoji = get_first_emoji(channel_name)
+    staff_info = mapping.get(emoji) if emoji else None
 
     if staff_info and staff_info.get("discord_user_id"):
         mention = f"<@{staff_info['discord_user_id']}>"
@@ -92,6 +96,25 @@ async def send_discord_notification(guild_name, channel_name, link, staff_info):
     else:
         mention = f"<@&{MENTOR_ROLE_ID}>"
         assignee = "未登録のためメンター全体"
+
+    return mention, assignee
+
+
+async def get_alert_channel():
+    alert_channel = client.get_channel(ALERT_CHANNEL_ID)
+    if alert_channel is None:
+        alert_channel = await client.fetch_channel(ALERT_CHANNEL_ID)
+    return alert_channel
+
+
+async def send_reply_notification(guild_name, channel_name, link, mapping):
+    try:
+        alert_channel = await get_alert_channel()
+    except Exception as e:
+        print(f"❌ 通知先チャンネル取得エラー: {e}")
+        return
+
+    mention, assignee = get_mention_and_assignee(channel_name, mapping)
 
     text = (
         f"{mention}\n\n"
@@ -104,19 +127,206 @@ async def send_discord_notification(guild_name, channel_name, link, staff_info):
 
     try:
         await alert_channel.send(text)
-        print(f"✅ Discord通知送信: #{channel_name} → {assignee}")
+        print(f"✅ 返信漏れ通知送信: #{channel_name} → {assignee}")
     except Exception as e:
         print(f"❌ Discord通知エラー: {e}")
 
 
-@tasks.loop(minutes=10)
-async def check_unanswered():
-    global notified
+async def send_followup_notification(guild_name, channel_name, link, mapping):
+    try:
+        alert_channel = await get_alert_channel()
+    except Exception as e:
+        print(f"❌ 通知先チャンネル取得エラー: {e}")
+        return
 
-    now = datetime.now(timezone.utc)
+    mention, assignee = get_mention_and_assignee(channel_name, mapping)
+
+    text = (
+        f"{mention}\n\n"
+        f"⚠️ **返信が来ていない可能性があります**\n\n"
+        f"**サーバー：** {guild_name}\n"
+        f"**チャンネル：** {channel_name}\n"
+        f"**状況：** 7日以上受講生からスタンプ・返信なし\n\n"
+        f"必要があれば、リマインドをお願いいたします！\n\n"
+        f"**該当メッセージ：**\n{link}"
+    )
+
+    try:
+        await alert_channel.send(text)
+        print(f"✅ 7日反応なし通知送信: #{channel_name} → {assignee}")
+    except Exception as e:
+        print(f"❌ Discord通知エラー: {e}")
+
+
+async def check_24h_reply_missing(guild, category, mapping, now):
+    global reply_notified
+
     check_before = now - timedelta(hours=24)
     check_after = now - timedelta(hours=48)
 
+    for channel in category.text_channels:
+        first_missed_link = None
+
+        try:
+            async for msg in channel.history(
+                after=check_after,
+                before=check_before,
+                oldest_first=True
+            ):
+                if msg.author.bot:
+                    continue
+
+                if str(msg.id) in reply_notified:
+                    continue
+
+                author = guild.get_member(msg.author.id)
+
+                if is_staff(author):
+                    reply_notified[str(msg.id)] = now.isoformat()
+                    continue
+
+                staff_responded = False
+
+                # この投稿より後にスタッフが投稿したか確認
+                async for later in channel.history(
+                    after=msg.created_at,
+                    oldest_first=True,
+                    limit=500
+                ):
+                    later_author = guild.get_member(later.author.id)
+                    if is_staff(later_author):
+                        staff_responded = True
+                        break
+
+                # スタッフのリアクション確認
+                if not staff_responded:
+                    try:
+                        full_msg = await channel.fetch_message(msg.id)
+
+                        for reaction in full_msg.reactions:
+                            async for user in reaction.users():
+                                member = guild.get_member(user.id)
+                                if is_staff(member):
+                                    staff_responded = True
+                                    break
+
+                            if staff_responded:
+                                break
+
+                    except Exception as e:
+                        print(f"⚠️ リアクション確認エラー: #{channel.name}: {e}")
+
+                reply_notified[str(msg.id)] = now.isoformat()
+
+                if not staff_responded and not first_missed_link:
+                    first_missed_link = msg.jump_url
+
+            if first_missed_link:
+                await send_reply_notification(
+                    guild.name,
+                    channel.name,
+                    first_missed_link,
+                    mapping
+                )
+                await asyncio.sleep(0.5)
+
+        except discord.Forbidden:
+            print(f"⚠️ アクセス権限なし: #{channel.name}")
+        except Exception as e:
+            print(f"❌ 24時間返信漏れチェックエラー (#{channel.name}): {e}")
+
+
+async def check_7d_no_student_reaction(guild, category, mapping, now):
+    global followup_notified
+
+    check_before = now - timedelta(days=7)
+    check_after = now - timedelta(days=14)
+
+    for channel in category.text_channels:
+        try:
+            latest_staff_msg = None
+
+            # 直近14日以内の中で、最新のスタッフ投稿を探す
+            async for msg in channel.history(
+                after=check_after,
+                limit=1000,
+                oldest_first=False
+            ):
+                if msg.author.bot:
+                    continue
+
+                author = guild.get_member(msg.author.id)
+
+                if is_staff(author):
+                    latest_staff_msg = msg
+                    break
+
+            if not latest_staff_msg:
+                continue
+
+            # 最新スタッフ投稿がまだ7日経っていなければ対象外
+            if latest_staff_msg.created_at > check_before:
+                continue
+
+            if str(latest_staff_msg.id) in followup_notified:
+                continue
+
+            student_responded = False
+
+            # 最新スタッフ投稿より後に、受講生の通常投稿があるか確認
+            async for later in channel.history(
+                after=latest_staff_msg.created_at,
+                oldest_first=True,
+                limit=500
+            ):
+                if later.author.bot:
+                    continue
+
+                later_member = guild.get_member(later.author.id)
+
+                if is_student(later_member, later.author):
+                    student_responded = True
+                    break
+
+            # 最新スタッフ投稿に、受講生リアクションがあるか確認
+            if not student_responded:
+                try:
+                    full_msg = await channel.fetch_message(latest_staff_msg.id)
+
+                    for reaction in full_msg.reactions:
+                        async for user in reaction.users():
+                            member = guild.get_member(user.id)
+
+                            if is_student(member, user):
+                                student_responded = True
+                                break
+
+                        if student_responded:
+                            break
+
+                except Exception as e:
+                    print(f"⚠️ 7日反応なしリアクション確認エラー: #{channel.name}: {e}")
+
+            followup_notified[str(latest_staff_msg.id)] = now.isoformat()
+
+            if not student_responded:
+                await send_followup_notification(
+                    guild.name,
+                    channel.name,
+                    latest_staff_msg.jump_url,
+                    mapping
+                )
+                await asyncio.sleep(0.5)
+
+        except discord.Forbidden:
+            print(f"⚠️ アクセス権限なし: #{channel.name}")
+        except Exception as e:
+            print(f"❌ 7日反応なしチェックエラー (#{channel.name}): {e}")
+
+
+@tasks.loop(minutes=10)
+async def check_all():
+    now = datetime.now(timezone.utc)
     mapping = load_mapping()
 
     for guild in client.guilds:
@@ -124,86 +334,16 @@ async def check_unanswered():
             category = discord.utils.get(guild.categories, name=category_name)
 
             if not category:
-                print(f"⚠️ {guild.name}: カテゴリ '{category_name}' が見つかりません")
+                print(f"ℹ️ {guild.name}: カテゴリ '{category_name}' は存在しません")
                 continue
 
-            for channel in category.text_channels:
-                first_missed_link = None
+            await check_24h_reply_missing(guild, category, mapping, now)
+            await check_7d_no_student_reaction(guild, category, mapping, now)
 
-                try:
-                    async for msg in channel.history(
-                        after=check_after,
-                        before=check_before,
-                        oldest_first=True
-                    ):
-                        if msg.author.bot:
-                            continue
+    save_notified(REPLY_NOTIFIED_FILE, reply_notified)
+    save_notified(FOLLOWUP_NOTIFIED_FILE, followup_notified)
 
-                        if str(msg.id) in notified:
-                            continue
-
-                        author = guild.get_member(msg.author.id)
-
-                        if is_staff(author):
-                            notified[str(msg.id)] = now.isoformat()
-                            continue
-
-                        staff_responded = False
-
-                        # この投稿より後にスタッフが投稿したか確認
-                        async for later in channel.history(
-                            after=msg.created_at,
-                            oldest_first=True,
-                            limit=500
-                        ):
-                            later_author = guild.get_member(later.author.id)
-                            if is_staff(later_author):
-                                staff_responded = True
-                                break
-
-                        # スタッフのリアクション確認
-                        if not staff_responded:
-                            try:
-                                full_msg = await channel.fetch_message(msg.id)
-
-                                for reaction in full_msg.reactions:
-                                    async for user in reaction.users():
-                                        member = guild.get_member(user.id)
-                                        if is_staff(member):
-                                            staff_responded = True
-                                            break
-
-                                    if staff_responded:
-                                        break
-
-                            except Exception as e:
-                                print(f"⚠️ リアクション確認エラー: #{channel.name}: {e}")
-
-                        notified[str(msg.id)] = now.isoformat()
-
-                        if not staff_responded and not first_missed_link:
-                            first_missed_link = msg.jump_url
-
-                    if first_missed_link:
-                        emoji = get_first_emoji(channel.name)
-                        staff_info = mapping.get(emoji) if emoji else None
-
-                        await send_discord_notification(
-                            guild.name,
-                            channel.name,
-                            first_missed_link,
-                            staff_info
-                        )
-
-                        await asyncio.sleep(0.5)
-
-                except discord.Forbidden:
-                    print(f"⚠️ アクセス権限なし: #{channel.name}")
-                except Exception as e:
-                    print(f"❌ エラー (#{channel.name}): {e}")
-
-    save_notified(notified)
-    print(f"✅ チェック完了 ({now.strftime('%Y-%m-%d %H:%M')} UTC)")
+    print(f"✅ 全チェック完了 ({now.strftime('%Y-%m-%d %H:%M')} UTC)")
 
 
 @client.event
@@ -211,8 +351,8 @@ async def on_ready():
     print(f"✅ ボット起動: {client.user}")
     threading.Thread(target=start_flask, daemon=True).start()
 
-    if not check_unanswered.is_running():
-        check_unanswered.start()
+    if not check_all.is_running():
+        check_all.start()
 
 
 client.run(DISCORD_TOKEN)
